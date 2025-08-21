@@ -1,0 +1,272 @@
+name: Nexus Client Worker Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'  # 推送版本标签时触发
+  workflow_dispatch:  # 支持手动触发
+    inputs:
+      version:
+        description: '版本号 (例如 1.0.0)'
+        required: true
+        default: '1.0.0'
+      skip_tags:
+        description: '跳过标签创建？'
+        type: boolean
+        required: false
+        default: false
+
+env:
+  PROJECT_NAME: nexus_client_worker
+  # Set the default Rust toolchain to use for all jobs
+  RUSTUP_TOOLCHAIN: nightly-2025-04-06
+
+jobs:
+  prepare:
+    name: Prepare Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version_tag: ${{ steps.set_version.outputs.version_tag }}
+      build_date: ${{ steps.set_date.outputs.build_date }}
+      version_number: ${{ steps.set_version.outputs.version_number }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+        if: ${{ !inputs.skip_tags }}
+        
+      - name: Set version
+        id: set_version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          elif [ -n "${{ github.ref_name }}" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="${{ inputs.version }}"
+          fi
+          
+          echo "version_tag=v$VERSION" >> $GITHUB_OUTPUT
+          echo "version_number=$VERSION" >> $GITHUB_OUTPUT
+          
+      - name: Set build date
+        id: set_date
+        run: |
+          BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          echo "build_date=$BUILD_DATE" >> $GITHUB_OUTPUT
+          
+      - name: Create tag (if manual)
+        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.skip_tags }}
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          
+          # 使用 token 设置远程 URL
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+          
+          # 创建并推送标签
+          git tag ${{ steps.set_version.outputs.version_tag }} ${{ github.sha }}
+          git push origin ${{ steps.set_version.outputs.version_tag }}
+
+  build:
+    name: Build for ${{ matrix.target }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux 目标 (动态链接)
+          - target: linux-gnu
+            rust_target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            bin_suffix: linux
+            
+          # Linux 目标 (静态链接)
+          - target: linux-musl
+            rust_target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            bin_suffix: linux-static
+            extra_packages: musl-tools
+            
+          # Windows 目标
+          - target: windows
+            rust_target: x86_64-pc-windows-msvc
+            os: windows-latest
+            bin_suffix: windows.exe
+            
+          # macOS Intel 目标
+          - target: macos-intel
+            rust_target: x86_64-apple-darwin
+            os: macos-latest
+            bin_suffix: macos-intel
+            
+          # macOS ARM 目标
+          - target: macos-arm
+            rust_target: aarch64-apple-darwin
+            os: macos-latest
+            bin_suffix: macos-arm
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+        
+      - name: Install system dependencies
+        if: ${{ matrix.extra_packages && runner.os == 'Linux' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.extra_packages }}
+          
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+          targets: ${{ matrix.rust_target }}
+          components: rustfmt
+      
+      - name: Debug Rust environment
+        run: |
+          echo "Rust version: $(rustc --version --verbose)"
+          echo "Cargo version: $(cargo --version)"
+          echo "Rustup installed targets: $(rustup target list --installed | tr '\n' ',' | sed 's/,$//')"
+          echo "Rustup active toolchain: $(rustup show active-toolchain)"
+          echo "Host target: $(rustc -vV | grep host)"
+          
+      - name: Build release (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cargo build --release --target ${{ matrix.rust_target }}
+          
+          # 移动文件
+          mv "target/${{ matrix.rust_target }}/release/${{ env.PROJECT_NAME }}" "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}"
+          
+          # 优化文件大小
+          if command -v llvm-strip > /dev/null 2>&1; then
+            llvm-strip "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}"
+          elif command -v strip > /dev/null 2>&1; then
+            strip "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}"
+          fi
+          
+      - name: Build release (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          cargo build --release --target ${{ matrix.rust_target }}
+          
+          # 移动文件
+          mv "target/${{ matrix.rust_target }}/release/${{ env.PROJECT_NAME }}" "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}"
+          
+          # 优化文件大小
+          if command -v llvm-strip > /dev/null 2>&1; then
+            llvm-strip "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}"
+          elif command -v strip > /dev/null 2>&1; then
+            strip "${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}"
+          fi
+          
+      - name: Build release (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          # 构建 Windows 可执行文件
+          cargo build --release --target ${{ matrix.rust_target }}
+          
+          # 定义路径变量
+          $binPath = "target\${{ matrix.rust_target }}\release\$env:PROJECT_NAME.exe"
+          $outputName = "$env:PROJECT_NAME-${{ matrix.bin_suffix }}"
+          
+          # 检查文件是否存在
+          if (-not (Test-Path $binPath)) {
+              Write-Error "Binary not found at $binPath"
+              Exit 1
+          }
+          
+          # 移动文件
+          Move-Item -Path $binPath -Destination $outputName -Force
+          
+          # 检查并应用 strip
+          if (Get-Command llvm-strip -ErrorAction SilentlyContinue) {
+              llvm-strip $outputName
+              Write-Host "Binary size reduced with llvm-strip"
+          }
+          elseif (Get-Command strip -ErrorAction SilentlyContinue) {
+              strip $outputName
+              Write-Host "Binary size reduced with strip"
+          }
+          else {
+              Write-Host "No strip tools available, skipping size reduction"
+          }
+        
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}-binary
+          path: ${{ env.PROJECT_NAME }}-${{ matrix.bin_suffix }}
+
+  create_release:
+    name: Create GitHub Release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: '*-binary'
+          merge-multiple: true
+          
+      - name: Verify downloaded artifacts
+        run: |
+          echo "Artifacts directory structure:"
+          find artifacts -type f -print
+          echo ""
+          echo "Total files: $(find artifacts -type f | wc -l)"
+        shell: bash
+          
+      - name: Prepare release assets
+        run: |
+          # 创建统一的发布目录
+          mkdir -p release_assets
+          
+          # 复制所有文件到统一目录
+          find artifacts -type f -exec cp {} release_assets \;
+          
+          # 列出所有文件
+          echo "Release assets:"
+          ls -lh release_assets
+        shell: bash
+        
+      - name: Create release
+        uses: softprops/action-gh-release@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ needs.prepare.outputs.version_tag }}
+          name: "Nexus Client Worker ${{ needs.prepare.outputs.version_number }}"
+          body: |
+            # Nexus Client Worker ${{ needs.prepare.outputs.version_number }}
+            
+            - Release date: ${{ needs.prepare.outputs.build_date }}
+            - Build commit: ${{ github.sha }}
+            - Built with Rust nightly
+            
+            ## Download Assets
+            
+            | Platform        | File                              |
+            |-----------------|-----------------------------------|
+            | Linux    | `nexus_client_worker-linux`              |
+            | Linux (备用)  | `nexus_client_worker-linux-static`       |
+            | Windows         | `nexus_client_worker-windows.exe`        |
+            | macOS Intel芯片     | `nexus_client_worker-macos-intel`        |
+            | macOS M芯片       | `nexus_client_worker-macos-arm`          |
+            
+          draft: false
+          prerelease: false
+          files: release_assets/*
